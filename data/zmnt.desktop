@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=zmnt
+Comment=Import, unlock, and mount ZFS datasets
+Exec=zmnt gui
+Icon=drive-harddisk
+Terminal=false
+Categories=System;Utility;
+Keywords=ZFS;mount;dataset;pool;

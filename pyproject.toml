@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zmnt"
+version = "0.1.0"
+description = "GUI wizard to import, unlock, and mount ZFS datasets"
+requires-python = ">=3.11"
+license = "GPL-3.0-or-later"
+
+[project.scripts]
+zmnt = "zfs_mount_wizard.__main__:main"
+zmnt-tui = "zfs_mount_wizard.tui:main"
+
+[tool.setuptools.packages.find]
+include = ["zfs_mount_wizard*"]
