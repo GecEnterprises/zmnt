@@ -131,10 +131,16 @@ class ZFSService:
     def load_key(self, root: str, passphrase: str) -> None:
         self.run("zfs", "load-key", root, input_text=f"{passphrase}\n")
 
+    def key_is_loaded(self, root: str) -> bool:
+        status, found = self.try_run("zfs", "get", "-H", "-o", "value", "keystatus", root)
+        return found and status.strip() == "available"
+
     def unload_keys(self, roots: list[str]) -> None:
         failures = []
         for root in roots:
             if root and root != "-":
+                if not self.key_is_loaded(root):
+                    continue
                 try:
                     self.run("zfs", "unload-key", root)
                 except ZFSError as error:
@@ -152,6 +158,21 @@ class ZFSService:
                 continue
             try:
                 self.run("zfs", "mount", name)
+            except ZFSError as error:
+                failures.append(f"{name}: {error}")
+        if failures:
+            raise ZFSError("\n".join(failures))
+
+    def unmount_datasets(self, names: list[str]) -> None:
+        failures = []
+        for name in names:
+            if not name:
+                continue
+            mounted, found = self.try_run("zfs", "get", "-H", "-o", "value", "mounted", name)
+            if found and mounted.strip() != "yes":
+                continue
+            try:
+                self.run("zfs", "unmount", name)
             except ZFSError as error:
                 failures.append(f"{name}: {error}")
         if failures:

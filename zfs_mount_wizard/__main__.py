@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+import argparse
+import getpass
+import json
 import pwd
 import shutil
 import subprocess
@@ -19,6 +22,9 @@ Commands:
   gui       Start the graphical interface
   help      Show this help message
   version   Show the installed version
+  daemon    Run the systemd automount lifecycle action
+  auto      Configure encrypted ZFS automount entries
+  service   Enable, disable, or inspect zmnt.service
 """
 
 
@@ -50,7 +56,7 @@ def command_from_args(args: Sequence[str]) -> tuple[str, list[str]]:
     if not args:
         return "tui", []
     command, *remaining = args
-    if command in {"tui", "gui"}:
+    if command in {"tui", "gui", "daemon", "auto", "service"}:
         return command, remaining
     if command in {"help", "--help", "-h"}:
         return "help", remaining
@@ -77,13 +83,113 @@ def run_gui() -> None:
     raise SystemExit(application.exec())
 
 
+def _automation_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="zmnt auto", description="Manage TPM-backed automount settings")
+    subparsers = parser.add_subparsers(dest="action", required=True)
+    subparsers.add_parser("list", help="Show configured encryption roots")
+    configure = subparsers.add_parser("configure", help="Store a credential and configure automount")
+    configure.add_argument("encryption_root")
+    configure.add_argument("datasets", nargs="+")
+    configure.add_argument("--backend", choices=("tpm2", "host+tpm2"), default="tpm2")
+    configure.add_argument("--credential-dir")
+    configure.add_argument("--no-automount", action="store_true")
+    configure.add_argument("--keep-loaded-on-stop", action="store_true")
+    clear = subparsers.add_parser("clear", help="Remove a stored credential")
+    clear.add_argument("encryption_root")
+    clear.add_argument("--unload", action="store_true", help="Also unmount and unload the active key")
+    remove = subparsers.add_parser("remove", help="Remove an entire automation entry")
+    remove.add_argument("encryption_root")
+    toggle = subparsers.add_parser("enable", help="Enable automount for an entry")
+    toggle.add_argument("encryption_root")
+    toggle = subparsers.add_parser("disable", help="Disable automount for an entry")
+    toggle.add_argument("encryption_root")
+    unload = subparsers.add_parser("unload", help="Unmount configured datasets and unload the active key")
+    unload.add_argument("encryption_root")
+    return parser
+
+
+def run_auto(arguments: list[str]) -> None:
+    from .automation import AutomationManager
+    from .zfs import ZFSError
+
+    options = _automation_parser().parse_args(arguments)
+    ensure_elevated_from_start(relaunch_args=["auto", *arguments])
+    manager = AutomationManager()
+    try:
+        if options.action == "list":
+            config = manager.load()
+            print(json.dumps({
+                "credential_dir": config.credential_dir,
+                "entries": [entry.__dict__ for entry in config.entries],
+            }, indent=2))
+        elif options.action == "configure":
+            secret = getpass.getpass(f"ZFS passphrase for {options.encryption_root}: ")
+            manager.configure(
+                options.encryption_root, options.datasets, secret, options.backend,
+                not options.no_automount, not options.keep_loaded_on_stop,
+                options.credential_dir,
+            )
+            print(f"Configured {options.encryption_root} ({options.backend}).")
+        elif options.action == "clear":
+            if options.unload:
+                manager.clear_active_key(options.encryption_root)
+            if not manager.remove_stored_credential(options.encryption_root):
+                raise ZFSError(f"No automation entry for {options.encryption_root}")
+            print(f"Removed stored credential for {options.encryption_root}.")
+        elif options.action == "remove":
+            if not manager.remove_entry(options.encryption_root):
+                raise ZFSError(f"No automation entry for {options.encryption_root}")
+            print(f"Removed automation entry for {options.encryption_root}.")
+        elif options.action == "unload":
+            manager.clear_active_key(options.encryption_root)
+            print(f"Unmounted datasets and unloaded {options.encryption_root}.")
+        else:
+            manager.set_automount(options.encryption_root, options.action == "enable")
+            print(f"Automount {'enabled' if options.action == 'enable' else 'disabled'} for {options.encryption_root}.")
+    except ZFSError as error:
+        print(f"{APP_NAME}: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+
+
+def run_daemon(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(prog="zmnt daemon")
+    parser.add_argument("action", choices=("start", "stop"))
+    options = parser.parse_args(arguments)
+    if os.geteuid() != 0:
+        print("zmnt: daemon actions must run as root", file=sys.stderr)
+        raise SystemExit(1)
+    from .automation import AutomationManager
+    from .zfs import ZFSError
+    try:
+        getattr(AutomationManager(), options.action)()
+    except ZFSError as error:
+        print(f"{APP_NAME}: {error}", file=sys.stderr)
+        raise SystemExit(1) from error
+
+
+def run_service(arguments: list[str]) -> None:
+    parser = argparse.ArgumentParser(prog="zmnt service")
+    parser.add_argument("action", choices=("enable", "disable", "status"))
+    options = parser.parse_args(arguments)
+    if options.action != "status":
+        ensure_elevated_from_start(relaunch_args=["service", *arguments])
+    command = ["systemctl"]
+    if options.action == "enable":
+        command.extend(["enable", "--now", "zmnt.service"])
+    elif options.action == "disable":
+        command.extend(["disable", "--now", "zmnt.service"])
+    else:
+        command.extend(["status", "--no-pager", "zmnt.service"])
+    raise SystemExit(subprocess.run(command, check=False).returncode)
+
+
 def main() -> None:
     try:
         command, remaining = command_from_args(sys.argv[1:])
     except ValueError as error:
         print(f"{APP_NAME}: {error}\n\n{USAGE}", file=sys.stderr)
         raise SystemExit(2) from error
-    if remaining:
+    if remaining and command not in {"daemon", "auto", "service"}:
         print(f"{APP_NAME}: command '{command}' does not accept arguments\n\n{USAGE}", file=sys.stderr)
         raise SystemExit(2)
     if command == "help":
@@ -91,6 +197,15 @@ def main() -> None:
         return
     if command == "version":
         print(VERSION)
+        return
+    if command == "auto":
+        run_auto(remaining)
+        return
+    if command == "daemon":
+        run_daemon(remaining)
+        return
+    if command == "service":
+        run_service(remaining)
         return
     if command == "tui":
         from .tui import main as tui_main

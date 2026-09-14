@@ -2,7 +2,7 @@
 # For AUR publication, replace source=() with a signed release tarball and checksum.
 pkgname=zmnt
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Interactive terminal and graphical ZFS mount wizard'
 arch=('any')
 url='https://github.com/your-account/zmnt'
@@ -32,4 +32,5 @@ package() {
   cd "$startdir"
   python -m installer --destdir="$pkgdir" dist/*.whl
   install -Dm644 data/zmnt.desktop "$pkgdir/usr/share/applications/zmnt.desktop"
+  install -Dm644 data/zmnt.service "$pkgdir/usr/lib/systemd/system/zmnt.service"
 }

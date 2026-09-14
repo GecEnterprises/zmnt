@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import subprocess
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -12,12 +13,14 @@ from PySide6.QtWidgets import (
 )
 
 from .zfs import DEFAULT_MOUNT_BASE, Dataset, Pool, ZFSError, ZFSService
+from .automation import AutomationManager, DEFAULT_CREDENTIAL_DIR
 
 
 class WizardWindow(QMainWindow):
     def __init__(self, service: ZFSService | None = None) -> None:
         super().__init__()
         self.service = service or ZFSService()
+        self.automation = AutomationManager(service=self.service)
         self.pools: dict[str, Pool] = {}
         self.active_pool: Pool | None = None
         self.datasets: list[Dataset] = []
@@ -25,6 +28,7 @@ class WizardWindow(QMainWindow):
         self.setWindowTitle("zmnt")
         self.resize(1120, 720)
         self._build_ui()
+        self._load_automation_settings()
         self.refresh_pools()
 
     def _build_ui(self) -> None:
@@ -58,6 +62,34 @@ class WizardWindow(QMainWindow):
         form.addRow(actions)
         layout.addWidget(pool_box)
 
+        automation_box = QGroupBox("Boot automount and key storage")
+        automation_form = QFormLayout(automation_box)
+        self.credential_backend = QComboBox()
+        self.credential_backend.addItems(["tpm2", "host+tpm2"])
+        self.credential_directory = QLineEdit(str(DEFAULT_CREDENTIAL_DIR))
+        self.automount_enabled = QCheckBox("Mount selected datasets at boot")
+        self.automount_enabled.setChecked(True)
+        self.clear_on_stop = QCheckBox("Unmount and unload keys when the service stops")
+        self.clear_on_stop.setChecked(True)
+        automation_form.addRow("Key protection", self.credential_backend)
+        automation_form.addRow("Encrypted credential directory", self.credential_directory)
+        automation_form.addRow(self.automount_enabled)
+        automation_form.addRow(self.clear_on_stop)
+        automation_actions = QHBoxLayout()
+        for label, callback in (
+            ("Store Keys for Selected", self.store_selected_keys),
+            ("Clear Stored Keys", self.clear_selected_stored_keys),
+            ("Unload Active Keys", self.unload_selected_active_keys),
+            ("Enable Daemon", lambda: self.set_daemon_enabled(True)),
+            ("Disable Daemon", lambda: self.set_daemon_enabled(False)),
+        ):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            automation_actions.addWidget(button)
+        automation_actions.addStretch()
+        automation_form.addRow(automation_actions)
+        layout.addWidget(automation_box)
+
         layout.addWidget(QLabel("Datasets"))
         self.table = QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(["Mount", "Dataset", "Determined mountpoint", "Encryption", "State", "Actions"])
@@ -87,6 +119,21 @@ class WizardWindow(QMainWindow):
         toolbar.addWidget(self.status)
         layout.addLayout(toolbar)
         self.setCentralWidget(root)
+
+    def _load_automation_settings(self) -> None:
+        try:
+            config = self.automation.load()
+        except ZFSError as error:
+            self.status.setText(str(error))
+            return
+        self.credential_directory.setText(config.credential_dir)
+        if config.entries:
+            entry = config.entries[0]
+            index = self.credential_backend.findText(entry.backend)
+            if index >= 0:
+                self.credential_backend.setCurrentIndex(index)
+            self.automount_enabled.setChecked(entry.automount)
+            self.clear_on_stop.setChecked(entry.clear_on_stop)
 
     def refresh_pools(self) -> None:
         try:
@@ -309,6 +356,75 @@ class WizardWindow(QMainWindow):
             self.service.open_mountpoint(dataset.actual_mount)
         except ZFSError as error:
             self._error("Could not open file manager", error)
+
+    def store_selected_keys(self) -> None:
+        selected = self.selected_datasets()
+        roots = sorted({item.encryption_root for item in selected if item.encryption_root != "-"})
+        if not roots:
+            self._message("Select one or more encrypted datasets first.")
+            return
+        for root in roots:
+            secret, accepted = QInputDialog.getText(
+                self, "Store TPM2 Credential", f"ZFS passphrase for {root}:",
+                QLineEdit.EchoMode.Password,
+            )
+            if not accepted:
+                return
+            datasets = [item.name for item in selected if item.encryption_root == root]
+            try:
+                self.automation.configure(
+                    root, datasets, secret, self.credential_backend.currentText(),
+                    self.automount_enabled.isChecked(), self.clear_on_stop.isChecked(),
+                    self.credential_directory.text().strip(),
+                )
+            except (ZFSError, OSError) as error:
+                self._error("Could not store credential", error)
+                return
+        self.status.setText(f"Stored {len(roots)} encrypted credential(s). Enable the daemon to use them at boot.")
+
+    def clear_selected_stored_keys(self) -> None:
+        roots = sorted({item.encryption_root for item in self.selected_datasets() if item.encryption_root != "-"})
+        if not roots:
+            self._message("Select one or more encrypted datasets first.")
+            return
+        if QMessageBox.question(
+            self, "Clear Stored Keys",
+            f"Remove {len(roots)} encrypted credential(s) and disable their automount entries?",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            removed = sum(self.automation.remove_stored_credential(root) for root in roots)
+        except (ZFSError, OSError) as error:
+            self._error("Could not clear stored credentials", error)
+            return
+        self.status.setText(f"Removed {removed} stored credential(s). Active ZFS keys were not changed.")
+
+    def unload_selected_active_keys(self) -> None:
+        roots = sorted({item.encryption_root for item in self.selected_datasets() if item.encryption_root != "-"})
+        if not roots:
+            self._message("Select one or more encrypted datasets first.")
+            return
+        if QMessageBox.question(
+            self, "Unload Active Keys",
+            "Unmount configured datasets and unload the selected active ZFS keys?",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            for root in roots:
+                self.automation.clear_active_key(root)
+        except ZFSError as error:
+            self._error("Could not unload key", error)
+            return
+        self.refresh_datasets()
+        self.status.setText(f"Unloaded {len(roots)} active key(s). Stored credentials were not changed.")
+
+    def set_daemon_enabled(self, enabled: bool) -> None:
+        arguments = ["systemctl", "enable" if enabled else "disable", "--now", "zmnt.service"]
+        result = subprocess.run(arguments, text=True, capture_output=True, check=False)
+        if result.returncode:
+            self._error("Could not update daemon", RuntimeError(result.stderr.strip() or result.stdout.strip()))
+            return
+        self.status.setText(f"zmnt daemon {'enabled and started' if enabled else 'disabled and stopped'}.")
 
     @staticmethod
     def _unique_roots(datasets: list[Dataset], loaded: bool) -> list[str]:
