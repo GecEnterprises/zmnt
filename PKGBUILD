@@ -2,14 +2,14 @@
 # For AUR publication, replace source=() with a signed release tarball and checksum.
 pkgname=zmnt
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Interactive terminal and graphical ZFS mount wizard'
 arch=('any')
 url='https://github.com/your-account/zmnt'
 license=('GPL-3.0-or-later')
 depends=(
   'python'
-  'python-pyside6'
+  'pyside6'
   'zfs-utils'
   'systemd'
   'xdg-utils'

@@ -73,6 +73,8 @@ class TUIApp:
             self.view = "pools"
         elif key == ord("u"):
             self.unlock_selected()
+        elif key == ord("U"):
+            self.mount_selected()
         elif key == ord("l"):
             self.lock_selected()
         elif key == ord("L"):
@@ -137,11 +139,23 @@ class TUIApp:
         return [dataset for dataset in self.datasets if dataset.name in self.selected]
 
     def unlock_selected(self) -> None:
-        roots = self.unique_roots(self.selected_datasets(), loaded=False)
+        selected = self.selected_datasets()
+        roots = self.unique_roots(selected, loaded=False)
         if not roots:
             self.status = "Selected datasets do not have unloaded keys."
             return
-        self.unlock_roots(roots, self.refresh_datasets)
+        mount_names = [
+            dataset.name
+            for dataset in selected
+            if dataset.mounted != "yes" and dataset.can_be_mounted
+        ]
+
+        def after_unlock() -> None:
+            self.refresh_datasets()
+            if mount_names and self.confirm(f"Mount {len(mount_names)} selected dataset(s) now?"):
+                self.mount_names(mount_names)
+
+        self.unlock_roots(roots, after_unlock)
 
     def lock_selected(self) -> None:
         roots = self.unique_roots(self.selected_datasets(), loaded=True)
@@ -203,7 +217,7 @@ class TUIApp:
             help_text = "Up/Down or j/k: select  Enter: use pool  a: altroot  f: force  r: refresh  q: quit"
         else:
             self.render_datasets(height, width)
-            help_text = "Up/Down or j/k: select  Space: toggle  u: unlock  l: lock  L: lock all  m: mount  o: open  b: pools  r: refresh  q: quit"
+            help_text = "Up/Down or j/k: select  Space: toggle  U: unlock+mount  u: unlock  l: lock  L: lock all  m: mount  o: open  b: pools  r: refresh  q: quit"
         self.add(height - 2, 0, self.status[:width - 1], curses.A_REVERSE)
         self.add(height - 1, 0, help_text[:width - 1], curses.A_DIM)
         self.screen.refresh()

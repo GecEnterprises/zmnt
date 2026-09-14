@@ -47,6 +47,24 @@ class ZFSParsingTests(unittest.TestCase):
 
         self.assertEqual(TUIApp.unique_roots([first, second], loaded=False), ["tank/key"])
 
+    def test_capital_u_unlocks_and_mounts(self) -> None:
+        app = TUIApp.__new__(TUIApp)
+        called = []
+        app.mount_selected = lambda: called.append("unlock+mount")
+
+        app.handle_dataset_key(ord("U"))
+
+        self.assertEqual(called, ["unlock+mount"])
+
+    def test_lowercase_u_uses_optional_mount_flow(self) -> None:
+        app = TUIApp.__new__(TUIApp)
+        called = []
+        app.unlock_selected = lambda: called.append("unlock")
+
+        app.handle_dataset_key(ord("u"))
+
+        self.assertEqual(called, ["unlock"])
+
     def test_command_dispatch_defaults_to_tui(self) -> None:
         self.assertEqual(command_from_args([]), ("tui", []))
         self.assertEqual(command_from_args(["gui"]), ("gui", []))

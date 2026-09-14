@@ -34,10 +34,10 @@ zmnt
 zmnt gui
 ```
 
-## Arch Linux
+## Arch Linux and CachyOS
 
-The in-tree `PKGBUILD` builds the current checkout. On Arch Linux, build and
-install it with:
+The in-tree `PKGBUILD` builds the current checkout. On Arch Linux or CachyOS,
+build and install it with:
 
 ```bash
 makepkg -sri
