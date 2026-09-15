@@ -89,10 +89,24 @@ class ZFSService:
         raise ZFSError("Imported pool not found after import")
 
     def import_pool(self, name: str, altroot: str, force: bool) -> None:
-        args = ["import", "-N", "-R", altroot]
+        args = ["import", "-N"]
+        if altroot:
+            args.extend(["-R", altroot])
         if force:
             args.append("-f")
         self.run("zpool", *args, name)
+
+    def pool_is_imported(self, name: str) -> bool:
+        _, found = self.try_run("zpool", "list", "-H", "-o", "name", name)
+        return found
+
+    def pool_altroot(self, name: str) -> str | None:
+        """Return the altroot of an imported pool ("" for none), or None if it is not imported."""
+        output, found = self.try_run("zpool", "get", "-H", "-o", "value", "altroot", name)
+        if not found:
+            return None
+        altroot = output.strip()
+        return "" if altroot == "-" else altroot
 
     def list_datasets(self, pool: Pool) -> list[Dataset]:
         altroot = pool.altroot

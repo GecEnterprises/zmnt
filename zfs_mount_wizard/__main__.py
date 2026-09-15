@@ -24,6 +24,8 @@ Commands:
   version   Show the installed version
   daemon    Run the systemd automount lifecycle action
   auto      Configure encrypted ZFS automount entries
+  automount Unlock and mount enabled entries now
+  reload    Reload the service unit and apply automount settings
   service   Enable, disable, or inspect zmnt.service
 """
 
@@ -56,7 +58,7 @@ def command_from_args(args: Sequence[str]) -> tuple[str, list[str]]:
     if not args:
         return "tui", []
     command, *remaining = args
-    if command in {"tui", "gui", "daemon", "auto", "service"}:
+    if command in {"tui", "gui", "daemon", "auto", "service", "automount", "reload"}:
         return command, remaining
     if command in {"help", "--help", "-h"}:
         return "help", remaining
@@ -87,6 +89,7 @@ def _automation_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="zmnt auto", description="Manage TPM-backed automount settings")
     subparsers = parser.add_subparsers(dest="action", required=True)
     subparsers.add_parser("list", help="Show configured encryption roots")
+    subparsers.add_parser("mount", help="Unlock and mount enabled entries now")
     configure = subparsers.add_parser("configure", help="Store a credential and configure automount")
     configure.add_argument("encryption_root")
     configure.add_argument("datasets", nargs="+")
@@ -116,7 +119,12 @@ def run_auto(arguments: list[str]) -> None:
     ensure_elevated_from_start(relaunch_args=["auto", *arguments])
     manager = AutomationManager()
     try:
-        if options.action == "list":
+        if options.action == "mount":
+            failures = manager.start()
+            if failures:
+                raise ZFSError("\n".join(failures))
+            print("Applied enabled automount entries.")
+        elif options.action == "list":
             config = manager.load()
             print(json.dumps({
                 "credential_dir": config.credential_dir,
@@ -161,20 +169,31 @@ def run_daemon(arguments: list[str]) -> None:
     from .automation import AutomationManager
     from .zfs import ZFSError
     try:
-        getattr(AutomationManager(), options.action)()
+        failures = getattr(AutomationManager(), options.action)()
     except ZFSError as error:
         print(f"{APP_NAME}: {error}", file=sys.stderr)
         raise SystemExit(1) from error
+    for failure in failures:
+        print(f"{APP_NAME}: {failure}", file=sys.stderr)
+    # A failed entry must not fail the start: systemd only runs ExecStop for units
+    # that started, so the entries that did unlock would keep their keys loaded.
+    if failures and options.action == "stop":
+        raise SystemExit(1)
 
 
 def run_service(arguments: list[str]) -> None:
     parser = argparse.ArgumentParser(prog="zmnt service")
-    parser.add_argument("action", choices=("enable", "disable", "status"))
+    parser.add_argument("action", choices=("enable", "disable", "status", "reload"))
     options = parser.parse_args(arguments)
     if options.action != "status":
         ensure_elevated_from_start(relaunch_args=["service", *arguments])
     command = ["systemctl"]
-    if options.action == "enable":
+    if options.action == "reload":
+        result = subprocess.run(["systemctl", "daemon-reload"], check=False)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+        command.extend(["reload-or-restart", "zmnt.service"])
+    elif options.action == "enable":
         command.extend(["enable", "--now", "zmnt.service"])
     elif options.action == "disable":
         command.extend(["disable", "--now", "zmnt.service"])
@@ -200,6 +219,12 @@ def main() -> None:
         return
     if command == "auto":
         run_auto(remaining)
+        return
+    if command == "automount":
+        run_auto(["mount"])
+        return
+    if command == "reload":
+        run_service(["reload"])
         return
     if command == "daemon":
         run_daemon(remaining)

@@ -1,0 +1,26 @@
+[Unit]
+Description=zmnt encrypted ZFS automount manager
+Documentation=man:systemd-creds(1) man:zfs-load-key(8)
+DefaultDependencies=no
+Wants=zfs-import.target
+# zmnt imports configured pools that the system import services skipped, such
+# as pools imported with an altroot (which never enter the cachefile).
+After=zfs-import.target systemd-udev-settle.service systemd-remount-fs.service
+Before=zfs-mount.service local-fs.target umount.target shutdown.target
+Conflicts=umount.target shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/zmnt daemon start
+ExecReload=/usr/bin/zmnt daemon start
+ExecStop=/usr/bin/zmnt daemon stop
+TimeoutStartSec=90s
+TimeoutStopSec=90s
+UMask=0077
+NoNewPrivileges=yes
+# Mounts must be created in the host namespace. Filesystem sandboxing such as
+# PrivateTmp, ProtectHome or ProtectSystem would isolate them from the host.
+
+[Install]
+WantedBy=local-fs.target

@@ -5,9 +5,11 @@ from __future__ import annotations
 import curses
 import os
 import sys
+import textwrap
 from collections.abc import Callable
 
 from .__main__ import APP_NAME, ensure_elevated_from_start
+from .automation import AutomationManager
 from .zfs import DEFAULT_MOUNT_BASE, Dataset, Pool, ZFSError, ZFSService
 
 
@@ -15,6 +17,7 @@ class TUIApp:
     def __init__(self, screen: curses.window, service: ZFSService | None = None) -> None:
         self.screen = screen
         self.service = service or ZFSService()
+        self.automation = AutomationManager(service=self.service)
         self.pools: list[Pool] = []
         self.pool_index = 0
         self.active_pool: Pool | None = None
@@ -40,7 +43,7 @@ class TUIApp:
                     self.handle_pool_key(key)
                 else:
                     self.handle_dataset_key(key)
-            except ZFSError as error:
+            except (ZFSError, OSError, ValueError) as error:
                 self.status = str(error)
 
     def handle_pool_key(self, key: int) -> None:
@@ -81,6 +84,8 @@ class TUIApp:
             self.lock_all()
         elif key == ord("m"):
             self.mount_selected()
+        elif key == ord("a"):
+            self.configure_automount()
         elif key == ord("o") and self.current_dataset:
             if self.current_dataset.actual_mount in {"", "none", "legacy"}:
                 self.status = f"No normal mountpoint is available for {self.current_dataset.name}."
@@ -208,6 +213,70 @@ class TUIApp:
     def unique_roots(datasets: list[Dataset], loaded: bool) -> list[str]:
         return sorted({dataset.encryption_root for dataset in datasets if (dataset.has_loaded_key if loaded else dataset.needs_key)})
 
+    def configure_automount(self) -> None:
+        selected = self.selected_datasets()
+        roots = sorted({d.encryption_root for d in selected if d.encryption_root != "-"})
+        config = self.automation.load()
+        entries = {entry.encryption_root: entry for entry in config.entries}
+        summary = ", ".join(
+            f"{root}: {'enabled' if entries[root].automount else 'disabled'}"
+            if root in entries else f"{root}: unconfigured" for root in roots
+        )
+        action = self.prompt(
+            f"Automount {summary or '(no encrypted selection)'} | c: configure, e: enable, d: disable, m: mount all, s: boot service"
+        )
+        if action is None:
+            return
+        action = action.strip().lower()
+        if action == "m":
+            failures = self.automation.start()
+            self.refresh_datasets()
+            self.status = (
+                f"Automount failed for {len(failures)} root(s): {'; '.join(failures)}"
+                if failures else "Applied all enabled automount entries."
+            )
+            return
+        if action == "s":
+            self.service.run("systemctl", "enable", "--now", "zmnt.service")
+            self.status = "Boot automount service enabled and started."
+            return
+        if action not in {"c", "e", "d"}:
+            self.status = "Automount action cancelled or unknown."
+            return
+        if not roots:
+            self.status = "Select encrypted datasets with Space first."
+            return
+        if action in {"e", "d"}:
+            for root in roots:
+                self.automation.set_automount(root, action == "e")
+            self.status = f"Automount {'enabled' if action == 'e' else 'disabled'} for {len(roots)} root(s)."
+            return
+        backend = self.prompt("Credential backend: tpm2 or host+tpm2", "tpm2")
+        if backend is None:
+            return
+        if backend not in {"tpm2", "host+tpm2"}:
+            raise ZFSError("Choose tpm2 or host+tpm2.")
+        # Gather inputs before saving so cancelling a prompt does not partially configure roots.
+        pending = []
+        for root in roots:
+            names = sorted(d.name for d in selected if d.encryption_root == root and d.can_be_mounted)
+            if not names:
+                raise ZFSError(f"No mountable datasets selected for {root}.")
+            secret = self.prompt(f"Passphrase for {root}", password=True)
+            if not secret:
+                self.status = "Automount configuration cancelled."
+                return
+            pending.append((root, names, secret))
+        if not self.confirm("Save selected datasets (replacing each root's list) and enable automount?"):
+            return
+        for root, names, secret in pending:
+            existing = entries.get(root)
+            self.automation.configure(
+                root, names, secret, backend, automount=True,
+                clear_on_stop=existing.clear_on_stop if existing else True,
+            )
+        self.status = "Automount saved. Use a → s for boot service, or a → m to mount now."
+
     def render(self) -> None:
         self.screen.erase()
         height, width = self.screen.getmaxyx()
@@ -217,7 +286,7 @@ class TUIApp:
             help_text = "Up/Down or j/k: select  Enter: use pool  a: altroot  f: force  r: refresh  q: quit"
         else:
             self.render_datasets(height, width)
-            help_text = "Up/Down or j/k: select  Space: toggle  U: unlock+mount  u: unlock  l: lock  L: lock all  m: mount  o: open  b: pools  r: refresh  q: quit"
+            help_text = "Space: select  a: automount  U: unlock+mount  u: unlock  l/L: lock/all  m: mount  o: open  b: pools  r: refresh  q: quit"
         self.add(height - 2, 0, self.status[:width - 1], curses.A_REVERSE)
         self.add(height - 1, 0, help_text[:width - 1], curses.A_DIM)
         self.screen.refresh()
@@ -256,7 +325,9 @@ class TUIApp:
             self.screen.erase()
             height, width = self.screen.getmaxyx()
             shown = "*" * len(value) if password else "".join(value)
-            self.add(height // 2 - 1, 2, label[:width - 4], curses.A_BOLD)
+            label_lines = textwrap.wrap(label, max(1, width - 4))
+            for index, line in enumerate(label_lines):
+                self.add(height // 2 - len(label_lines) + index, 2, line, curses.A_BOLD)
             self.add(height // 2, 2, shown[:width - 4])
             self.add(height // 2 + 2, 2, "Enter: confirm  Esc: cancel", curses.A_DIM)
             self.screen.move(height // 2, min(width - 3, 2 + len(shown)))

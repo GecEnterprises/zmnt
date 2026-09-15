@@ -10,12 +10,14 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from .zfs import ZFSError, ZFSService
+from .zfs import DEFAULT_MOUNT_BASE, ZFSError, ZFSService
 
 
 DEFAULT_CONFIG = Path("/etc/zmnt/config.json")
 DEFAULT_CREDENTIAL_DIR = Path("/etc/credstore.encrypted/zmnt")
 VALID_BACKENDS = {"tpm2", "host+tpm2"}
+# Failures that affect a single entry; the daemon reports them and continues.
+ENTRY_ERRORS = (ZFSError, OSError, ValueError)
 
 
 @dataclass
@@ -26,6 +28,9 @@ class AutomountEntry:
     credential: str = ""
     backend: str = "tpm2"
     clear_on_stop: bool = True
+    # Pool altroot used when zmnt has to import the pool itself: "" for none,
+    # None when unknown (entries saved before this was recorded).
+    altroot: str | None = None
 
 
 @dataclass
@@ -43,6 +48,10 @@ def validate_zfs_name(value: str) -> str:
     if not value or value.startswith("-") or any(char.isspace() for char in value):
         raise ValueError(f"Invalid ZFS dataset name: {value!r}")
     return value
+
+
+def pool_name(dataset: str) -> str:
+    return dataset.split("/", 1)[0]
 
 
 class AutomationManager:
@@ -120,8 +129,12 @@ class AutomationManager:
         os.chmod(temporary, 0o600)
         os.replace(temporary, destination)
 
+        existing = next((item for item in config.entries if item.encryption_root == encryption_root), None)
+        altroot = self.service.pool_altroot(pool_name(encryption_root))
+        if altroot is None and existing is not None:
+            altroot = existing.altroot
         entry = AutomountEntry(
-            encryption_root, datasets, automount, destination.name, backend, clear_on_stop,
+            encryption_root, datasets, automount, destination.name, backend, clear_on_stop, altroot,
         )
         config.entries = [item for item in config.entries if item.encryption_root != encryption_root]
         config.entries.append(entry)
@@ -163,22 +176,34 @@ class AutomationManager:
         entry.automount = enabled
         self.save(config)
 
-    def start(self) -> None:
+    def start(self) -> list[str]:
+        """Import, unlock and mount every enabled entry.
+
+        A failing entry does not stop the others; failures are returned instead
+        of raised. Only an unreadable configuration raises.
+        """
         config = self.load()
         failures: list[str] = []
+        pool_errors: dict[str, str] = {}
         for entry in config.entries:
             if not entry.automount:
                 continue
             try:
+                validate_zfs_name(entry.encryption_root)
+                pool = pool_name(entry.encryption_root)
+                if pool not in pool_errors:
+                    pool_errors[pool] = self._ensure_pool_imported(pool, entry.altroot)
+                if pool_errors[pool]:
+                    raise ZFSError(f"pool {pool} is not imported: {pool_errors[pool]}")
                 if not self.service.key_is_loaded(entry.encryption_root):
                     self._load_credential(config, entry)
                 self.service.mount_datasets(entry.datasets)
-            except ZFSError as error:
+            except ENTRY_ERRORS as error:
                 failures.append(f"{entry.encryption_root}: {error}")
-        if failures:
-            raise ZFSError("\n".join(failures))
+        return failures
 
-    def stop(self) -> None:
+    def stop(self) -> list[str]:
+        """Unmount and unload entries that clear on stop, returning failures."""
         config = self.load()
         failures: list[str] = []
         for entry in reversed(config.entries):
@@ -187,10 +212,21 @@ class AutomationManager:
             try:
                 self.service.unmount_datasets(list(reversed(entry.datasets)))
                 self.service.unload_keys([entry.encryption_root])
-            except ZFSError as error:
+            except ENTRY_ERRORS as error:
                 failures.append(f"{entry.encryption_root}: {error}")
-        if failures:
-            raise ZFSError("\n".join(failures))
+        return failures
+
+    def _ensure_pool_imported(self, pool: str, altroot: str | None) -> str:
+        """Import the pool if needed. Returns an error message, or "" on success."""
+        try:
+            if self.service.pool_is_imported(pool):
+                return ""
+            if altroot is None:
+                altroot = f"{DEFAULT_MOUNT_BASE}/{pool}"
+            self.service.import_pool(pool, altroot, force=False)
+        except ENTRY_ERRORS as error:
+            return str(error) or "import failed"
+        return ""
 
     def clear_active_key(self, encryption_root: str) -> None:
         config = self.load()
@@ -211,14 +247,19 @@ class AutomationManager:
         )
         assert decrypt.stdout is not None
         load = subprocess.run(
-            ["zfs", "load-key", entry.encryption_root], stdin=decrypt.stdout,
+            ["zfs", "load-key", "-L", "prompt", entry.encryption_root], stdin=decrypt.stdout,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
         decrypt.stdout.close()
         decrypt_error = decrypt.stderr.read() if decrypt.stderr else b""
         decrypt_status = decrypt.wait()
         if decrypt_status:
-            raise ZFSError(decrypt_error.decode(errors="replace").strip() or "Credential decryption failed")
+            message = decrypt_error.decode(errors="replace").strip()
+            load_error = load.stderr.decode(errors="replace").strip()
+            detail = message or f"Credential decryption exited with status {decrypt_status}"
+            if load.returncode and load_error:
+                detail += f"; zfs load-key: {load_error}"
+            raise ZFSError(detail)
         if load.returncode:
             message = load.stderr.decode(errors="replace").strip()
             raise ZFSError(message or "ZFS key loading failed")
